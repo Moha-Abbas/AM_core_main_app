@@ -62,12 +62,31 @@ class LoadFormChangeWorkspace(View):
 
         is_administration = request.POST.get("administration", False) == "True"
 
+        # Preselect the document's current workspace, if it can be resolved.
+        # The document type isn't sent by the caller, so try both APIs -
+        # this endpoint is shared by the data and blob "Change workspace"
+        # actions.
+        document_id = request.POST.get("document_id")
+        current_workspace_id = None
+        if document_id:
+            document = None
+            try:
+                document = data_api.get_by_id(document_id, request.user)
+            except Exception:
+                try:
+                    document = blob_api.get_by_id(document_id, request.user)
+                except Exception:
+                    document = None
+            if document is not None and document.workspace is not None:
+                current_workspace_id = document.workspace.id
+
         try:
             form = ChangeWorkspaceForm(
                 request.user,
                 list(),
                 is_administration,
                 self.show_global_workspace,
+                current_workspace_id,
             )
         except DoesNotExist as dne:
             return HttpResponseBadRequest(escape(str(dne)))
@@ -500,6 +519,11 @@ class AssignView(View):
             except Exception:
                 return HttpResponseBadRequest("Something wrong happened.")
 
+        # Each id is resolved and assigned independently, so a single
+        # stale/missing/inaccessible id in a bulk selection doesn't abort
+        # the move for the rest of the batch.
+        assigned_count = 0
+        skipped_count = 0
         for data_id in document_ids:
             try:
                 self.api.assign(
@@ -507,13 +531,27 @@ class AssignView(View):
                     workspace,
                     request.user,
                 )
-            except AccessControlError as ace:
-                return HttpResponseForbidden(escape(str(ace)))
+                assigned_count += 1
             except Exception:
-                return HttpResponseBadRequest("Something wrong happened.")
+                skipped_count += 1
 
+        if assigned_count == 0 and skipped_count > 0:
+            return HttpResponseBadRequest(
+                "Unable to move: the selected item(s) could not be found "
+                "or you don't have the rights to move them. Please "
+                "refresh the page and try again."
+            )
+
+        # No django `messages` added here: a large selection is sent as
+        # several chunked requests, and each one hitting this view would
+        # queue its own message - the client aggregates the
+        # assigned/skipped counts across all chunks into a single
+        # notification instead.
         return HttpResponse(
-            json.dumps({}), content_type="application/javascript"
+            json.dumps(
+                {"assigned": assigned_count, "skipped": skipped_count}
+            ),
+            content_type="application/javascript",
         )
 
 
